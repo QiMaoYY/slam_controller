@@ -1,0 +1,8 @@
+# 停止建图服务
+# 请求（无参数）
+---
+# 响应
+bool success             # 操作是否成功
+string message           # 返回消息
+
+

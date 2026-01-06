@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>slam_controller</name>
+  <version>1.0.0</version>
+  <description>SLAM系统总控节点，提供ROS Service接口管理建图、定位、导航等功能</description>
+  <maintainer email="user@todo.todo">Kuavo Team</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <!-- 消息生成依赖 -->
+  <build_depend>message_generation</build_depend>
+  <exec_depend>message_runtime</exec_depend>
+
+  <!-- ROS基础依赖 -->
+  <depend>rospy</depend>
+  <depend>std_msgs</depend>
+
+  <!-- 依赖kuavo_slam包（用于调用其脚本） -->
+  <exec_depend>kuavo_slam</exec_depend>
+
+  <export>
+  </export>
+</package>
+

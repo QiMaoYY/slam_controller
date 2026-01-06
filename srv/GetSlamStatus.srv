@@ -1,0 +1,9 @@
+# 获取SLAM系统状态服务
+# 请求（无参数）
+---
+# 响应
+string status            # 当前状态: idle/mapping/localizing/navigating
+string message           # 状态描述信息
+int64 uptime_sec         # 当前任务运行时间（秒）
+
+

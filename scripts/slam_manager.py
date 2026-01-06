@@ -1,0 +1,427 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Kuavo SLAM 总控节点
+功能：管理SLAM系统状态，提供ROS Service接口控制建图、定位、导航等功能
+
+作者：Kuavo Team
+日期：2026-01-05
+
+使用方法：
+    1. 启动节点：roslaunch kuavo_slam slam_manager.launch
+    2. 或直接运行：python3 slam_manager.py
+
+服务接口：
+    - /slam_manager/start_mapping  开始建图
+    - /slam_manager/stop_mapping   停止建图
+    - /slam_manager/get_status     获取系统状态
+"""
+
+import os
+import signal
+import subprocess
+import threading
+import time
+from enum import Enum
+from typing import Optional
+
+import rospy
+
+# Service消息类型（编译后自动生成）
+from slam_controller.srv import (
+    StartMapping, StartMappingResponse,
+    StopMapping, StopMappingResponse,
+    GetSlamStatus, GetSlamStatusResponse,
+)
+
+
+class SlamState(Enum):
+    """SLAM系统状态枚举"""
+    IDLE = "idle"                    # 空闲状态
+    MAPPING = "mapping"              # 建图中
+    LOCALIZING = "localizing"        # 定位中
+    NAVIGATING = "navigating"        # 导航中
+    ERROR = "error"                  # 错误状态
+
+
+class SlamManager:
+    """
+    SLAM系统总控管理器
+    
+    负责：
+    1. 维护系统状态
+    2. 管理子进程（建图、导航脚本）
+    3. 提供ROS Service接口
+    """
+    
+    def __init__(self):
+        # 初始化ROS节点
+        rospy.init_node('slam_manager', anonymous=False)
+        
+        # 获取kuavo_slam包路径（用于定位建图和导航脚本）
+        self.kuavo_slam_path = rospy.get_param(
+            '~kuavo_slam_path', 
+            '/media/data/slam_ws/src/kuavo_slam'
+        )
+        self.mapping_script = os.path.join(
+            self.kuavo_slam_path, 'scripts', 'start_mapping.sh'
+        )
+        self.nav_script = os.path.join(
+            self.kuavo_slam_path, 'scripts', 'nav_run.sh'
+        )
+        
+        # 系统状态
+        self._state = SlamState.IDLE
+        self._state_lock = threading.Lock()
+        self._task_start_time: Optional[float] = None
+        self._status_message = "系统就绪"
+        
+        # 子进程管理
+        self._current_process: Optional[subprocess.Popen] = None
+        self._process_lock = threading.Lock()
+        self._output_thread: Optional[threading.Thread] = None
+        
+        # 注册ROS Service
+        self._setup_services()
+        
+        # 注册节点关闭回调
+        rospy.on_shutdown(self._on_shutdown)
+        
+        rospy.loginfo("[SlamManager] 初始化完成，等待服务调用...")
+        rospy.loginfo(f"[SlamManager] 建图脚本路径: {self.mapping_script}")
+        rospy.loginfo(f"[SlamManager] 导航脚本路径: {self.nav_script}")
+    
+    def _setup_services(self):
+        """注册ROS Service服务"""
+        # 建图相关服务
+        self._srv_start_mapping = rospy.Service(
+            '~start_mapping', 
+            StartMapping, 
+            self._handle_start_mapping
+        )
+        self._srv_stop_mapping = rospy.Service(
+            '~stop_mapping', 
+            StopMapping, 
+            self._handle_stop_mapping
+        )
+        
+        # 状态查询服务
+        self._srv_get_status = rospy.Service(
+            '~get_status', 
+            GetSlamStatus, 
+            self._handle_get_status
+        )
+        
+        rospy.loginfo("[SlamManager] 服务已注册:")
+        rospy.loginfo("  - /slam_manager/start_mapping")
+        rospy.loginfo("  - /slam_manager/stop_mapping")
+        rospy.loginfo("  - /slam_manager/get_status")
+    
+    @property
+    def state(self) -> SlamState:
+        """获取当前状态（线程安全）"""
+        with self._state_lock:
+            return self._state
+    
+    @state.setter
+    def state(self, new_state: SlamState):
+        """设置当前状态（线程安全）"""
+        with self._state_lock:
+            old_state = self._state
+            self._state = new_state
+            if old_state != new_state:
+                rospy.loginfo(f"[SlamManager] 状态变更: {old_state.value} -> {new_state.value}")
+    
+    def _get_uptime(self) -> int:
+        """获取当前任务运行时间（秒）"""
+        if self._task_start_time is None:
+            return 0
+        return int(time.time() - self._task_start_time)
+    
+    def _handle_start_mapping(self, req: StartMapping) -> StartMappingResponse:
+        """
+        处理开始建图请求
+        
+        Args:
+            req: StartMapping请求，包含need_calibration参数
+            
+        Returns:
+            StartMappingResponse: 操作结果
+        """
+        rospy.loginfo(f"[SlamManager] 收到开始建图请求 (校准={req.need_calibration})")
+        
+        # 检查当前状态
+        if self.state != SlamState.IDLE:
+            msg = f"无法开始建图：当前状态为 {self.state.value}"
+            rospy.logwarn(f"[SlamManager] {msg}")
+            return StartMappingResponse(success=False, message=msg)
+        
+        # 检查脚本是否存在
+        if not os.path.exists(self.mapping_script):
+            msg = f"建图脚本不存在: {self.mapping_script}"
+            rospy.logerr(f"[SlamManager] {msg}")
+            return StartMappingResponse(success=False, message=msg)
+        
+        # 构建命令
+        cmd = ['/bin/bash', self.mapping_script]
+        if not req.need_calibration:
+            cmd.append('--no-calib')
+        
+        try:
+            # 启动建图脚本
+            # 使用start_new_session=True创建新的进程组，方便后续发送信号
+            with self._process_lock:
+                self._current_process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,  # 创建新的会话和进程组
+                    universal_newlines=True,
+                    bufsize=1,  # 行缓冲
+                )
+            
+            # 启动输出监控线程
+            self._output_thread = threading.Thread(
+                target=self._monitor_process_output,
+                args=(self._current_process, "建图"),
+                daemon=True
+            )
+            self._output_thread.start()
+            
+            # 更新状态
+            self.state = SlamState.MAPPING
+            self._task_start_time = time.time()
+            self._status_message = "建图进行中"
+            
+            calib_str = "含校准" if req.need_calibration else "跳过校准"
+            msg = f"建图已启动 ({calib_str})"
+            rospy.loginfo(f"[SlamManager] {msg}")
+            return StartMappingResponse(success=True, message=msg)
+            
+        except Exception as e:
+            msg = f"启动建图脚本失败: {str(e)}"
+            rospy.logerr(f"[SlamManager] {msg}")
+            self.state = SlamState.ERROR
+            self._status_message = msg
+            return StartMappingResponse(success=False, message=msg)
+    
+    def _handle_stop_mapping(self, req: StopMapping) -> StopMappingResponse:
+        """
+        处理停止建图请求
+        
+        向建图脚本发送SIGINT信号，触发脚本的trap handler执行地图保存和清理操作
+        
+        Args:
+            req: StopMapping请求
+            
+        Returns:
+            StopMappingResponse: 操作结果
+        """
+        rospy.loginfo("[SlamManager] 收到停止建图请求")
+        
+        # 检查当前状态
+        if self.state != SlamState.MAPPING:
+            msg = f"无法停止建图：当前状态为 {self.state.value}，不是建图状态"
+            rospy.logwarn(f"[SlamManager] {msg}")
+            return StopMappingResponse(success=False, message=msg)
+        
+        try:
+            with self._process_lock:
+                if self._current_process is None:
+                    msg = "建图进程不存在"
+                    rospy.logwarn(f"[SlamManager] {msg}")
+                    self.state = SlamState.IDLE
+                    return StopMappingResponse(success=False, message=msg)
+                
+                # 获取进程组ID并发送SIGINT信号
+                # 这等同于在终端中按Ctrl+C
+                try:
+                    pgid = os.getpgid(self._current_process.pid)
+                    rospy.loginfo(f"[SlamManager] 向进程组 {pgid} 发送SIGINT信号（触发脚本清理和保存地图）...")
+                    os.killpg(pgid, signal.SIGINT)
+                except ProcessLookupError:
+                    rospy.logwarn("[SlamManager] 进程已不存在")
+                    self._current_process = None
+                    self.state = SlamState.IDLE
+                    return StopMappingResponse(success=True, message="建图进程已结束")
+            
+            # 启动异步等待线程，避免阻塞服务响应
+            def wait_for_process():
+                """异步等待进程退出"""
+                timeout = 60
+                start_wait = time.time()
+                
+                while True:
+                    with self._process_lock:
+                        if self._current_process is None:
+                            rospy.loginfo("[SlamManager] 建图进程已被清理")
+                            break
+                        ret = self._current_process.poll()
+                        if ret is not None:
+                            rospy.loginfo(f"[SlamManager] 建图脚本已退出，返回码: {ret}")
+                            self._current_process = None
+                            self.state = SlamState.IDLE
+                            self._task_start_time = None
+                            self._status_message = "建图已完成，地图已保存"
+                            break
+                    
+                    if time.time() - start_wait > timeout:
+                        rospy.logwarn("[SlamManager] 等待建图脚本退出超时，强制终止...")
+                        with self._process_lock:
+                            if self._current_process:
+                                try:
+                                    pgid = os.getpgid(self._current_process.pid)
+                                    os.killpg(pgid, signal.SIGKILL)
+                                    rospy.loginfo(f"[SlamManager] 已强制终止进程组 {pgid}")
+                                except:
+                                    pass
+                                self._current_process = None
+                            self.state = SlamState.IDLE
+                            self._task_start_time = None
+                            self._status_message = "建图强制停止"
+                        break
+                    
+                    time.sleep(0.5)
+            
+            # 启动后台等待线程
+            wait_thread = threading.Thread(target=wait_for_process, daemon=True)
+            wait_thread.start()
+            
+            # 立即返回响应，不等待进程退出
+            msg = "停止建图指令已发送，正在后台执行地图保存和清理..."
+            rospy.loginfo(f"[SlamManager] {msg}")
+            return StopMappingResponse(success=True, message=msg)
+            
+        except Exception as e:
+            msg = f"停止建图时发生错误: {str(e)}"
+            rospy.logerr(f"[SlamManager] {msg}")
+            # 确保状态被重置
+            with self._process_lock:
+                self._current_process = None
+            self.state = SlamState.ERROR
+            self._status_message = msg
+            return StopMappingResponse(success=False, message=msg)
+    
+    def _handle_get_status(self, req: GetSlamStatus) -> GetSlamStatusResponse:
+        """
+        处理状态查询请求
+        
+        Args:
+            req: GetSlamStatus请求
+            
+        Returns:
+            GetSlamStatusResponse: 当前系统状态
+        """
+        return GetSlamStatusResponse(
+            status=self.state.value,
+            message=self._status_message,
+            uptime_sec=self._get_uptime()
+        )
+    
+    def _monitor_process_output(self, process: subprocess.Popen, task_name: str):
+        """
+        监控子进程输出并记录到ROS日志
+        
+        Args:
+            process: 子进程对象
+            task_name: 任务名称（用于日志前缀）
+        """
+        try:
+            for line in iter(process.stdout.readline, ''):
+                if line:
+                    # 移除ANSI颜色代码以便日志更清晰
+                    clean_line = self._strip_ansi(line.rstrip())
+                    if clean_line:
+                        rospy.loginfo(f"[{task_name}] {clean_line}")
+                        
+                # 检查进程是否已结束
+                if process.poll() is not None:
+                    break
+                    
+        except Exception as e:
+            rospy.logwarn(f"[SlamManager] 监控{task_name}输出时发生错误: {e}")
+        
+        finally:
+            # 进程结束，检查是否需要更新状态
+            rospy.loginfo(f"[SlamManager] {task_name}进程输出监控结束")
+            
+            # 如果进程意外结束（不是通过stop命令），更新状态
+            with self._process_lock:
+                if self._current_process == process:
+                    ret = process.poll()
+                    if ret is not None:
+                        self._current_process = None
+                        if self.state == SlamState.MAPPING:
+                            self.state = SlamState.IDLE
+                            self._task_start_time = None
+                            if ret == 0:
+                                self._status_message = f"{task_name}正常完成"
+                            else:
+                                self._status_message = f"{task_name}异常退出 (code={ret})"
+                                rospy.logwarn(f"[SlamManager] {self._status_message}")
+    
+    @staticmethod
+    def _strip_ansi(text: str) -> str:
+        """移除ANSI转义序列（颜色代码等）"""
+        import re
+        ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+        return ansi_escape.sub('', text)
+    
+    def _on_shutdown(self):
+        """节点关闭时的清理操作"""
+        rospy.loginfo("[SlamManager] 节点正在关闭，清理资源...")
+        
+        # 如果有正在运行的进程，发送终止信号
+        with self._process_lock:
+            if self._current_process is not None:
+                try:
+                    pgid = os.getpgid(self._current_process.pid)
+                    rospy.loginfo(f"[SlamManager] 终止运行中的进程组 {pgid}...")
+                    os.killpg(pgid, signal.SIGINT)
+                    
+                    # 等待一段时间让进程完成清理
+                    time.sleep(3)
+                    
+                    # 如果还没退出，强制终止
+                    if self._current_process.poll() is None:
+                        os.killpg(pgid, signal.SIGKILL)
+                        
+                except ProcessLookupError:
+                    pass
+                except Exception as e:
+                    rospy.logwarn(f"[SlamManager] 清理进程时发生错误: {e}")
+        
+        rospy.loginfo("[SlamManager] 清理完成")
+    
+    def spin(self):
+        """主循环"""
+        rate = rospy.Rate(1)  # 1Hz
+        
+        while not rospy.is_shutdown():
+            # 检查子进程是否意外退出
+            with self._process_lock:
+                if self._current_process is not None:
+                    ret = self._current_process.poll()
+                    if ret is not None and self.state == SlamState.MAPPING:
+                        rospy.logwarn(f"[SlamManager] 检测到建图进程已退出 (code={ret})")
+                        self._current_process = None
+                        self.state = SlamState.IDLE
+                        self._task_start_time = None
+            
+            rate.sleep()
+
+
+def main():
+    """主函数入口"""
+    try:
+        manager = SlamManager()
+        manager.spin()
+    except rospy.ROSInterruptException:
+        pass
+    except Exception as e:
+        rospy.logerr(f"[SlamManager] 发生未处理的异常: {e}")
+        raise
+
+
+if __name__ == '__main__':
+    main()

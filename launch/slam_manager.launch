@@ -1,0 +1,32 @@
+<?xml version="1.0"?>
+<launch>
+    <!-- 
+    Kuavo SLAM 总控节点启动文件
+    
+    使用方法:
+        roslaunch kuavo_slam slam_manager.launch
+    
+    注意: 
+        1. 需要确保使用正确的Python环境 (conda activate demo)
+        2. 推荐使用 run_slam_manager.sh 脚本启动，自动配置环境
+    
+    服务接口:
+        - /slam_manager/start_mapping  开始建图 (参数: need_calibration)
+        - /slam_manager/stop_mapping   停止建图
+        - /slam_manager/get_status     获取系统状态
+    
+    示例:
+        rosservice call /slam_manager/start_mapping "need_calibration: true"
+        rosservice call /slam_manager/stop_mapping "{}"
+        rosservice call /slam_manager/get_status "{}"
+    -->
+    
+    <!-- 参数 -->
+    <arg name="kuavo_slam_path" default="$(find kuavo_slam)" />
+    
+    <!-- 启动SLAM管理节点 -->
+    <node pkg="slam_controller" type="slam_manager.py" name="slam_manager" output="screen">
+        <param name="kuavo_slam_path" value="$(arg kuavo_slam_path)" />
+    </node>
+    
+</launch>

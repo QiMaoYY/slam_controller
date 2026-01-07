@@ -1,8 +1,8 @@
 # 停止建图服务
-# 请求（无参数）
+# 请求
+bool save_map            # 是否保存地图
+string map_name          # 地图名称（仅当save_map为true时有效）
 ---
 # 响应
 bool success             # 操作是否成功
 string message           # 返回消息
-
-

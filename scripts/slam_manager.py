@@ -205,19 +205,117 @@ class SlamManager:
             self._status_message = msg
             return StartMappingResponse(success=False, message=msg)
     
+    def _validate_map_name(self, map_name: str) -> tuple:
+        """
+        验证地图名称的合法性
+        
+        Args:
+            map_name: 地图名称
+            
+        Returns:
+            (bool, str): (是否合法, 错误信息)
+        """
+        if not map_name:
+            return False, "地图名称不能为空"
+        
+        # 检查非法字符
+        import re
+        if not re.match(r'^[a-zA-Z0-9_\-]+$', map_name):
+            return False, "地图名称只能包含字母、数字、下划线和横线"
+        
+        # 检查长度
+        if len(map_name) > 50:
+            return False, "地图名称过长（最多50个字符）"
+        
+        # 检查是否已存在
+        maps_dir = os.path.join(self.kuavo_slam_path, 'maps')
+        map_dir = os.path.join(maps_dir, map_name)
+        
+        if os.path.exists(map_dir):
+            return False, f"地图 '{map_name}' 已存在"
+        
+        return True, ""
+    
+    def _save_map(self, map_name: str) -> tuple:
+        """
+        保存地图文件
+        
+        Args:
+            map_name: 地图名称
+            
+        Returns:
+            (bool, str): (是否成功, 消息)
+        """
+        try:
+            # 验证地图名
+            valid, error_msg = self._validate_map_name(map_name)
+            if not valid:
+                return False, error_msg
+            
+            # 路径定义
+            maps_dir = os.path.join(self.kuavo_slam_path, 'maps')
+            map_dir = os.path.join(maps_dir, map_name)
+            faster_lio_pcd_dir = '/media/data/slam_ws/src/faster-lio/PCD'
+            
+            # 检查faster-lio PCD目录是否存在
+            if not os.path.exists(faster_lio_pcd_dir):
+                return False, f"未找到faster-lio PCD目录: {faster_lio_pcd_dir}"
+            
+            # 查找PCD文件
+            import glob
+            pcd_files = glob.glob(os.path.join(faster_lio_pcd_dir, '*.pcd'))
+            
+            if not pcd_files:
+                return False, "未找到PCD地图文件，可能建图时间太短"
+            
+            # 创建地图目录
+            os.makedirs(map_dir, exist_ok=True)
+            rospy.loginfo(f"[SlamManager] 创建地图目录: {map_dir}")
+            
+            # 移动并重命名PCD文件
+            saved_files = []
+            for pcd_file in pcd_files:
+                src_filename = os.path.basename(pcd_file)
+                # 重命名为 mapname_ori.pcd
+                dst_filename = f"{map_name}_ori.pcd"
+                dst_path = os.path.join(map_dir, dst_filename)
+                
+                # 移动文件
+                import shutil
+                shutil.move(pcd_file, dst_path)
+                saved_files.append(dst_filename)
+                rospy.loginfo(f"[SlamManager] 已保存: {src_filename} -> {dst_path}")
+            
+            msg = f"地图已保存到: {map_dir}/ (文件: {', '.join(saved_files)})"
+            rospy.loginfo(f"[SlamManager] {msg}")
+            return True, msg
+            
+        except Exception as e:
+            error_msg = f"保存地图时发生错误: {str(e)}"
+            rospy.logerr(f"[SlamManager] {error_msg}")
+            return False, error_msg
+    
     def _handle_stop_mapping(self, req: StopMapping) -> StopMappingResponse:
         """
         处理停止建图请求
         
-        向建图脚本发送SIGINT信号，触发脚本的trap handler执行地图保存和清理操作
+        向建图脚本发送SIGINT信号，触发脚本的trap handler执行清理操作
+        如果需要保存地图，则在脚本退出后执行地图保存
         
         Args:
-            req: StopMapping请求
+            req: StopMapping请求，包含save_map和map_name参数
             
         Returns:
             StopMappingResponse: 操作结果
         """
-        rospy.loginfo("[SlamManager] 收到停止建图请求")
+        rospy.loginfo(f"[SlamManager] 收到停止建图请求 (保存={req.save_map}, 地图名={req.map_name})")
+        
+        # 如果需要保存地图，先验证地图名
+        if req.save_map:
+            valid, error_msg = self._validate_map_name(req.map_name)
+            if not valid:
+                rospy.logwarn(f"[SlamManager] 地图名验证失败: {error_msg}")
+                return StopMappingResponse(success=False, message=f"地图名非法: {error_msg}")
         
         # 检查当前状态
         if self.state != SlamState.MAPPING:
@@ -247,10 +345,11 @@ class SlamManager:
             
             # 启动异步等待线程，避免阻塞服务响应
             def wait_for_process():
-                """异步等待进程退出"""
+                """异步等待进程退出并处理地图保存"""
                 timeout = 60
                 start_wait = time.time()
                 
+                # 等待进程退出
                 while True:
                     with self._process_lock:
                         if self._current_process is None:
@@ -260,9 +359,6 @@ class SlamManager:
                         if ret is not None:
                             rospy.loginfo(f"[SlamManager] 建图脚本已退出，返回码: {ret}")
                             self._current_process = None
-                            self.state = SlamState.IDLE
-                            self._task_start_time = None
-                            self._status_message = "建图已完成，地图已保存"
                             break
                     
                     if time.time() - start_wait > timeout:
@@ -276,19 +372,40 @@ class SlamManager:
                                 except:
                                     pass
                                 self._current_process = None
-                            self.state = SlamState.IDLE
-                            self._task_start_time = None
-                            self._status_message = "建图强制停止"
                         break
                     
                     time.sleep(0.5)
+                
+                # 等待PCD文件写入完成
+                rospy.loginfo("[SlamManager] 等待PCD文件写入完成...")
+                time.sleep(3)
+                
+                # 处理地图保存
+                if req.save_map:
+                    rospy.loginfo(f"[SlamManager] 开始保存地图: {req.map_name}")
+                    success, msg = self._save_map(req.map_name)
+                    if success:
+                        self._status_message = f"建图完成，地图已保存: {req.map_name}"
+                    else:
+                        self._status_message = f"建图完成，但保存地图失败: {msg}"
+                        rospy.logerr(f"[SlamManager] {self._status_message}")
+                else:
+                    rospy.loginfo("[SlamManager] 不保存地图，跳过")
+                    self._status_message = "建图完成（未保存地图）"
+                
+                # 更新状态
+                self.state = SlamState.IDLE
+                self._task_start_time = None
             
             # 启动后台等待线程
             wait_thread = threading.Thread(target=wait_for_process, daemon=True)
             wait_thread.start()
             
             # 立即返回响应，不等待进程退出
-            msg = "停止建图指令已发送，正在后台执行地图保存和清理..."
+            if req.save_map:
+                msg = f"停止建图指令已发送，将保存地图到: {req.map_name}"
+            else:
+                msg = "停止建图指令已发送（不保存地图）"
             rospy.loginfo(f"[SlamManager] {msg}")
             return StopMappingResponse(success=True, message=msg)
             

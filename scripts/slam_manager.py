@@ -87,9 +87,9 @@ class SlamManager:
         # 注册节点关闭回调
         rospy.on_shutdown(self._on_shutdown)
         
-        rospy.loginfo("[SlamManager] 初始化完成，等待服务调用...")
         rospy.loginfo(f"[SlamManager] 建图脚本路径: {self.mapping_script}")
         rospy.loginfo(f"[SlamManager] 导航脚本路径: {self.nav_script}")
+        rospy.loginfo("[SlamManager] 初始化完成，等待服务调用...")
     
     def _setup_services(self):
         """注册ROS Service服务"""
@@ -112,10 +112,7 @@ class SlamManager:
             self._handle_get_status
         )
         
-        rospy.loginfo("[SlamManager] 服务已注册:")
-        rospy.loginfo("  - /slam_manager/start_mapping")
-        rospy.loginfo("  - /slam_manager/stop_mapping")
-        rospy.loginfo("  - /slam_manager/get_status")
+        rospy.loginfo("[SlamManager] 服务已注册")
     
     @property
     def state(self) -> SlamState:
@@ -276,8 +273,8 @@ class SlamManager:
             saved_files = []
             for pcd_file in pcd_files:
                 src_filename = os.path.basename(pcd_file)
-                # 重命名为 mapname_ori.pcd
-                dst_filename = f"{map_name}_ori.pcd"
+                # 重命名为 pointcloud_original.pcd
+                dst_filename = f"pointcloud_original.pcd"
                 dst_path = os.path.join(map_dir, dst_filename)
                 
                 # 移动文件
@@ -376,9 +373,6 @@ class SlamManager:
                     
                     time.sleep(0.5)
                 
-                # 等待PCD文件写入完成
-                rospy.loginfo("[SlamManager] 等待PCD文件写入完成...")
-                time.sleep(3)
                 
                 # 处理地图保存
                 if req.save_map:

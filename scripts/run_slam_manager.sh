@@ -29,34 +29,26 @@ error() {
 }
 
 # ============== 主流程 ==============
-info "Kuavo SLAM Manager 启动脚本"
-info "========================================="
-
 # 注意：此脚本假设在交互式shell中运行（已自动加载.bashrc）
 # 如果从GUI启动，terminator会使用 bash -i 启动交互式shell
 
-# 1. 检查conda环境
-info "检查conda环境..."
-if [ -n "${CONDA_DEFAULT_ENV}" ]; then
-    success "已在conda环境: ${CONDA_DEFAULT_ENV}"
-else
-    info "尝试激活conda环境: ${CONDA_ENV}"
-    if [ -f "${HOME}/miniconda3/etc/profile.d/conda.sh" ]; then
-        source "${HOME}/miniconda3/etc/profile.d/conda.sh"
-    elif [ -f "${HOME}/anaconda3/etc/profile.d/conda.sh" ]; then
-        source "${HOME}/anaconda3/etc/profile.d/conda.sh"
-    fi
-    
-    if [ -n "$(command -v conda)" ]; then
-        conda activate ${CONDA_ENV} 2>/dev/null
-        if [ $? -eq 0 ]; then
-            success "conda环境 ${CONDA_ENV} 已激活"
-        else
-            error "激活conda环境失败，使用当前环境"
-        fi
+# 1. 激活conda环境
+info "激活conda环境: ${CONDA_ENV}"
+if [ -f "${HOME}/miniconda3/etc/profile.d/conda.sh" ]; then
+    source "${HOME}/miniconda3/etc/profile.d/conda.sh"
+elif [ -f "${HOME}/anaconda3/etc/profile.d/conda.sh" ]; then
+    source "${HOME}/anaconda3/etc/profile.d/conda.sh"
+fi
+
+if [ -n "$(command -v conda)" ]; then
+    conda activate ${CONDA_ENV} 2>/dev/null
+    if [ $? -eq 0 ]; then
+        success "conda环境 ${CONDA_ENV} 已激活"
     else
-        error "未找到conda，使用系统Python"
+        error "激活conda环境失败，使用当前环境"
     fi
+else
+    error "未找到conda，使用系统Python"
 fi
 
 info "Python版本: $(python3 --version)"
@@ -68,16 +60,7 @@ if [ -n "${ROS_VERSION}" ]; then
     success "ROS环境已配置 (ROS_VERSION=${ROS_VERSION})"
     info "ROS_PACKAGE_PATH=${ROS_PACKAGE_PATH}"
 else
-    info "ROS环境未配置，尝试加载..."
-    if [ -f "/opt/ros/noetic/setup.bash" ]; then
-        source /opt/ros/noetic/setup.bash
-        success "ROS Noetic环境已加载"
-    elif [ -f "/opt/ros/melodic/setup.bash" ]; then
-        source /opt/ros/melodic/setup.bash
-        success "ROS Melodic环境已加载"
-    else
-        error "未找到ROS安装"
-    fi
+    error "ROS环境未配置"
 fi
 
 # 3. 检查工作空间（bashrc可能已经配置）
@@ -98,8 +81,6 @@ fi
 info "检查ROS Master..."
 if ! rostopic list &>/dev/null; then
     error "ROS Master未运行"
-    error "slam_manager需要roscore运行，请先启动: roscore"
-    error "尝试继续运行..."
 else
     success "ROS Master已运行"
 fi
@@ -109,7 +90,7 @@ info "启动SLAM Manager节点..."
 info "========================================="
 echo ""
 
-python3 ${SLAM_WS}/src/kuavo_slam/scripts/slam_manager.py
+python3 ${SLAM_WS}/src/slam_controller/scripts/slam_manager.py
 
 # 检查退出状态
 EXIT_CODE=$?

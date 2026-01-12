@@ -22,6 +22,7 @@ import signal
 import subprocess
 import threading
 import time
+from datetime import datetime
 from enum import Enum
 from typing import Optional
 
@@ -454,6 +455,10 @@ class SlamManager:
         try:
             map_names = []
             nav_ready = []
+            map_paths = []
+            created_at = []
+            ori_pointcloud_bytes = []
+            nav_pointcloud_bytes = []
 
             for entry in sorted(os.listdir(maps_dir)):
                 subdir = os.path.join(maps_dir, entry)
@@ -461,26 +466,69 @@ class SlamManager:
                     continue
 
                 # 有效地图判定
-                valid_flag = os.path.isfile(os.path.join(subdir, 'pointcloud_original.pcd'))
+                ori_pcd_path = os.path.join(subdir, 'pointcloud_original.pcd')
+                valid_flag = os.path.isfile(ori_pcd_path)
                 if not valid_flag:
                     continue
 
                 # 可导航判定
+                nav_pcd_path = os.path.join(subdir, 'pointcloud.pcd')
                 nav_flag = (
                     os.path.isfile(os.path.join(subdir, 'map2d.yaml')) and
                     os.path.isfile(os.path.join(subdir, 'map2d.pgm')) and
-                    os.path.isfile(os.path.join(subdir, 'pointcloud.pcd'))
+                    os.path.isfile(nav_pcd_path)
                 )
 
                 map_names.append(entry)
                 nav_ready.append(bool(nav_flag))
+                map_paths.append(subdir)
+
+                # 地图创建时间：取原始点云文件mtime
+                try:
+                    ts = os.path.getmtime(ori_pcd_path)
+                    created_at.append(datetime.fromtimestamp(ts).strftime('%Y%m%d_%H%M%S'))
+                except Exception:
+                    created_at.append('')
+
+                # 原始点云大小
+                try:
+                    ori_pointcloud_bytes.append(int(os.path.getsize(ori_pcd_path)))
+                except Exception:
+                    ori_pointcloud_bytes.append(0)
+
+                # 导航点云大小（仅对可导航地图有效）
+                if nav_flag:
+                    try:
+                        nav_pointcloud_bytes.append(int(os.path.getsize(nav_pcd_path)))
+                    except Exception:
+                        nav_pointcloud_bytes.append(0)
+                else:
+                    nav_pointcloud_bytes.append(0)
 
             msg = f"已发现有效地图 {len(map_names)} 个"
-            return ListMapsResponse(success=True, message=msg, map_names=map_names, nav_ready=nav_ready)
+            return ListMapsResponse(
+                success=True,
+                message=msg,
+                map_names=map_names,
+                nav_ready=nav_ready,
+                map_paths=map_paths,
+                created_at=created_at,
+                ori_pointcloud_bytes=ori_pointcloud_bytes,
+                nav_pointcloud_bytes=nav_pointcloud_bytes,
+            )
         except Exception as e:
             msg = f"扫描maps目录失败: {e}"
             rospy.logerr(f"[SlamManager] {msg}")
-            return ListMapsResponse(success=False, message=msg, map_names=[], nav_ready=[])
+            return ListMapsResponse(
+                success=False,
+                message=msg,
+                map_names=[],
+                nav_ready=[],
+                map_paths=[],
+                created_at=[],
+                ori_pointcloud_bytes=[],
+                nav_pointcloud_bytes=[],
+            )
     
     def _monitor_process_output(self, process: subprocess.Popen, task_name: str):
         """

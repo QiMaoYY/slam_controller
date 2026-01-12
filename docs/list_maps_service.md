@@ -27,6 +27,10 @@
 - **message**：补充信息（例如发现的有效地图数量、失败原因）
 - **map_names**：有效地图名称列表（即子文件夹名）
 - **nav_ready**：与 `map_names` 一一对应，表示该地图是否满足“可用于导航”的文件完整性要求
+- **map_paths**：与 `map_names` 一一对应，地图目录完整路径
+- **created_at**：与 `map_names` 一一对应，地图创建时间字符串（`YYYYMMDD_HHMMSS`，取 `pointcloud_original.pcd` 的mtime）
+- **ori_pointcloud_bytes**：与 `map_names` 一一对应，`pointcloud_original.pcd` 文件大小（字节）
+- **nav_pointcloud_bytes**：与 `map_names` 一一对应，`pointcloud.pcd` 文件大小（字节）；若 `nav_ready=false` 则为 `0`
 
 ## 调用示例
 

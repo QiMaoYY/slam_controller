@@ -12,5 +12,9 @@ bool success
 string message
 string[] map_names          # 有效地图列表（存在pointcloud_original.pcd的子文件夹名）
 bool[] nav_ready            # 与map_names一一对应：是否可用于导航（3个文件齐全）
+string[] map_paths          # 与map_names一一对应：地图文件夹完整路径
+string[] created_at         # 与map_names一一对应：地图创建时间（YYYYMMDD_HHMMSS，取pointcloud_original.pcd的mtime）
+uint64[] ori_pointcloud_bytes   # 与map_names一一对应：pointcloud_original.pcd大小（字节）
+uint64[] nav_pointcloud_bytes   # 与map_names一一对应：pointcloud.pcd大小（字节）；若nav_ready=false则为0
 
 

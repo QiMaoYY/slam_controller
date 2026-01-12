@@ -32,6 +32,7 @@ from slam_controller.srv import (
     StartMapping, StartMappingResponse,
     StopMapping, StopMappingResponse,
     GetSlamStatus, GetSlamStatusResponse,
+    ListMaps, ListMapsResponse,
 )
 
 
@@ -110,6 +111,13 @@ class SlamManager:
             '~get_status', 
             GetSlamStatus, 
             self._handle_get_status
+        )
+
+        # 地图列表查询服务
+        self._srv_list_maps = rospy.Service(
+            '~list_maps',
+            ListMaps,
+            self._handle_list_maps
         )
         
         rospy.loginfo("[SlamManager] 服务已注册")
@@ -428,6 +436,51 @@ class SlamManager:
             message=self._status_message,
             uptime_sec=self._get_uptime()
         )
+
+    def _handle_list_maps(self, req: ListMaps) -> ListMapsResponse:
+        """
+        查询地图列表，并判断每个地图是否可用于导航。
+
+        判定规则（扫描 kuavo_slam/maps 下的子目录）：
+        - 若存在 pointcloud_original.pcd => 认为该目录为“有效地图”
+        - 若同时存在 map2d.yaml、map2d.pgm、pointcloud.pcd => 认为“可用于导航”
+        """
+        maps_dir = os.path.join(self.kuavo_slam_path, 'maps')
+        if not os.path.isdir(maps_dir):
+            msg = f"maps目录不存在: {maps_dir}"
+            rospy.logwarn(f"[SlamManager] {msg}")
+            return ListMapsResponse(success=False, message=msg, map_names=[], nav_ready=[])
+
+        try:
+            map_names = []
+            nav_ready = []
+
+            for entry in sorted(os.listdir(maps_dir)):
+                subdir = os.path.join(maps_dir, entry)
+                if not os.path.isdir(subdir):
+                    continue
+
+                # 有效地图判定
+                valid_flag = os.path.isfile(os.path.join(subdir, 'pointcloud_original.pcd'))
+                if not valid_flag:
+                    continue
+
+                # 可导航判定
+                nav_flag = (
+                    os.path.isfile(os.path.join(subdir, 'map2d.yaml')) and
+                    os.path.isfile(os.path.join(subdir, 'map2d.pgm')) and
+                    os.path.isfile(os.path.join(subdir, 'pointcloud.pcd'))
+                )
+
+                map_names.append(entry)
+                nav_ready.append(bool(nav_flag))
+
+            msg = f"已发现有效地图 {len(map_names)} 个"
+            return ListMapsResponse(success=True, message=msg, map_names=map_names, nav_ready=nav_ready)
+        except Exception as e:
+            msg = f"扫描maps目录失败: {e}"
+            rospy.logerr(f"[SlamManager] {msg}")
+            return ListMapsResponse(success=False, message=msg, map_names=[], nav_ready=[])
     
     def _monitor_process_output(self, process: subprocess.Popen, task_name: str):
         """

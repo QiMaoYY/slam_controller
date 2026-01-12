@@ -13,6 +13,7 @@ add_service_files(
   StartMapping.srv
   StopMapping.srv
   GetSlamStatus.srv
+  ListMaps.srv
 )
 
 # 生成消息和服务

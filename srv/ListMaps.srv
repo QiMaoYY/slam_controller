@@ -1,0 +1,16 @@
+# 获取地图列表服务
+#
+# 说明：
+# - 扫描 kuavo_slam/maps 目录下的子文件夹
+# - 若子文件夹中存在 pointcloud_original.pcd，则认为该子文件夹是一个“有效地图”
+# - 若同时存在 map2d.yaml、map2d.pgm、pointcloud.pcd，则认为该地图“可用于导航”
+#
+# 请求（无参数）
+---
+# 响应
+bool success
+string message
+string[] map_names          # 有效地图列表（存在pointcloud_original.pcd的子文件夹名）
+bool[] nav_ready            # 与map_names一一对应：是否可用于导航（3个文件齐全）
+
+

@@ -34,6 +34,7 @@ from slam_controller.srv import (
     StopMapping, StopMappingResponse,
     GetSlamStatus, GetSlamStatusResponse,
     ListMaps, ListMapsResponse,
+    ProcessMap, ProcessMapResponse,
 )
 
 
@@ -43,6 +44,7 @@ class SlamState(Enum):
     MAPPING = "mapping"              # 建图中
     LOCALIZING = "localizing"        # 定位中
     NAVIGATING = "navigating"        # 导航中
+    PROCESSING = "processing"        # 地图处理中
     ERROR = "error"                  # 错误状态
 
 
@@ -59,18 +61,35 @@ class SlamManager:
     def __init__(self):
         # 初始化ROS节点
         rospy.init_node('slam_manager', anonymous=False)
-        
-        # 获取kuavo_slam包路径（用于定位建图和导航脚本）
-        self.kuavo_slam_path = rospy.get_param(
-            '~kuavo_slam_path', 
-            '/media/data/slam_ws/src/kuavo_slam'
-        )
-        self.mapping_script = os.path.join(
-            self.kuavo_slam_path, 'scripts', 'start_mapping.sh'
-        )
-        self.nav_script = os.path.join(
-            self.kuavo_slam_path, 'scripts', 'nav_run.sh'
-        )
+
+        # 全局配置（从配置文件读取，可被ROS参数覆盖）
+        self.cfg = self._load_global_config()
+
+        # 路径：优先配置文件，其次ROS参数兜底
+        self.slam_ws = self._cfg_get('paths.slam_ws', '/media/data/slam_ws')
+        self.kuavo_slam_path = rospy.get_param('~kuavo_slam_path', self._cfg_get('paths.kuavo_slam', '/media/data/slam_ws/src/kuavo_slam'))
+        self.livox_ws = self._cfg_get('paths.livox_ws', '/media/data/livox_ws')
+        self.faster_lio_pcd_dir = self._cfg_get('paths.faster_lio_pcd_dir', '/media/data/slam_ws/src/faster-lio/PCD')
+
+        # 脚本路径
+        self.mapping_script = self._cfg_get('scripts.start_mapping', os.path.join(self.kuavo_slam_path, 'scripts', 'start_mapping.sh'))
+        self.nav_script = self._cfg_get('scripts.nav_run', os.path.join(self.kuavo_slam_path, 'scripts', 'nav_run.sh'))
+        self.map_process_script = self._cfg_get('scripts.map_processing', '/media/data/slam_ws/src/pcd_cleaner/scripts/run_all.sh')
+
+        # 地图目录与文件名约定
+        self.map_root = self._cfg_get('maps.root', os.path.join(self.kuavo_slam_path, 'maps'))
+        self.ori_pointcloud_name = self._cfg_get('maps.ori_pointcloud_name', 'pointcloud_original.pcd')
+        self.nav_pointcloud_name = self._cfg_get('maps.nav_pointcloud_name', 'pointcloud.pcd')
+        self.map2d_yaml_name = self._cfg_get('maps.map2d_yaml_name', 'map2d.yaml')
+        self.map2d_pgm_name = self._cfg_get('maps.map2d_pgm_name', 'map2d.pgm')
+
+        # 地图处理默认参数
+        self.ceiling_threshold = str(self._cfg_get('map_processing.ceiling_threshold', 0.8))
+        self.default_process_mode = int(self._cfg_get('map_processing.default_mode', 0))
+
+        # 超时参数
+        self.stop_mapping_wait_sec = int(self._cfg_get('timeouts.stop_mapping_wait_sec', 60))
+        self.process_map_wait_sec = int(self._cfg_get('timeouts.process_map_wait_sec', 0))
         
         # 系统状态
         self._state = SlamState.IDLE
@@ -82,6 +101,10 @@ class SlamManager:
         self._current_process: Optional[subprocess.Popen] = None
         self._process_lock = threading.Lock()
         self._output_thread: Optional[threading.Thread] = None
+
+        # 地图处理子进程管理
+        self._map_process: Optional[subprocess.Popen] = None
+        self._map_process_lock = threading.Lock()
         
         # 注册ROS Service
         self._setup_services()
@@ -89,9 +112,13 @@ class SlamManager:
         # 注册节点关闭回调
         rospy.on_shutdown(self._on_shutdown)
         
-        rospy.loginfo(f"[SlamManager] 建图脚本路径: {self.mapping_script}")
-        rospy.loginfo(f"[SlamManager] 导航脚本路径: {self.nav_script}")
-        rospy.loginfo("[SlamManager] 初始化完成，等待服务调用...")
+        rospy.loginfo(f"建图脚本路径: {self.mapping_script}")
+        rospy.loginfo(f"导航脚本路径: {self.nav_script}")
+        rospy.loginfo(f"地图处理脚本路径: {self.map_process_script}")
+        rospy.loginfo(f"地图根目录(map_root): {self.map_root}")
+        rospy.loginfo(f"屋顶阈值(ceiling_threshold): {self.ceiling_threshold}")
+        rospy.loginfo(f"faster-lio PCD目录: {self.faster_lio_pcd_dir}")
+        rospy.loginfo("初始化完成，等待服务调用...")
     
     def _setup_services(self):
         """注册ROS Service服务"""
@@ -120,8 +147,59 @@ class SlamManager:
             ListMaps,
             self._handle_list_maps
         )
+
+        # 地图处理服务
+        self._srv_process_map = rospy.Service(
+            '~process_map',
+            ProcessMap,
+            self._handle_process_map
+        )
         
-        rospy.loginfo("[SlamManager] 服务已注册")
+        rospy.loginfo("服务已注册")
+
+    def _cfg_get(self, key: str, default=None):
+        """从self.cfg中读取点分key（如 paths.slam_ws），并做路径展开。"""
+        cur = self.cfg or {}
+        for part in key.split('.'):
+            if not isinstance(cur, dict) or part not in cur:
+                return default
+            cur = cur[part]
+        # 对字符串做环境变量/用户目录展开
+        if isinstance(cur, str):
+            return os.path.expandvars(os.path.expanduser(cur))
+        return cur
+
+    def _load_global_config(self) -> dict:
+        """
+        读取 slam_controller 全局配置文件。
+
+        默认路径：<slam_controller>/config/slam_controller.yaml
+        可用参数覆盖：~global_config
+        """
+        cfg_path = rospy.get_param('~global_config', '')
+        if not cfg_path:
+            try:
+                import rospkg
+                pkg_path = rospkg.RosPack().get_path('slam_controller')
+                cfg_path = os.path.join(pkg_path, 'config', 'slam_controller.yaml')
+            except Exception:
+                cfg_path = ''
+
+        if cfg_path and os.path.isfile(cfg_path):
+            try:
+                import yaml
+                with open(cfg_path, 'r', encoding='utf-8') as f:
+                    data = yaml.safe_load(f) or {}
+                if isinstance(data, dict):
+                    rospy.loginfo(f"已加载全局配置: {cfg_path}")
+                    return data
+                rospy.logwarn(f"全局配置格式不为dict: {cfg_path}，将使用空配置")
+            except Exception as e:
+                rospy.logwarn(f"加载全局配置失败({cfg_path}): {e}，将使用空配置")
+        else:
+            rospy.logwarn("未找到全局配置文件，将使用空配置")
+
+        return {}
     
     @property
     def state(self) -> SlamState:
@@ -136,7 +214,7 @@ class SlamManager:
             old_state = self._state
             self._state = new_state
             if old_state != new_state:
-                rospy.loginfo(f"[SlamManager] 状态变更: {old_state.value} -> {new_state.value}")
+                rospy.loginfo(f"状态变更: {old_state.value} -> {new_state.value}")
     
     def _get_uptime(self) -> int:
         """获取当前任务运行时间（秒）"""
@@ -154,18 +232,18 @@ class SlamManager:
         Returns:
             StartMappingResponse: 操作结果
         """
-        rospy.loginfo(f"[SlamManager] 收到开始建图请求 (校准={req.need_calibration})")
+        rospy.loginfo(f"收到开始建图请求 (校准={req.need_calibration})")
         
         # 检查当前状态
         if self.state != SlamState.IDLE:
             msg = f"无法开始建图：当前状态为 {self.state.value}"
-            rospy.logwarn(f"[SlamManager] {msg}")
+            rospy.logwarn(f"{msg}")
             return StartMappingResponse(success=False, message=msg)
         
         # 检查脚本是否存在
         if not os.path.exists(self.mapping_script):
             msg = f"建图脚本不存在: {self.mapping_script}"
-            rospy.logerr(f"[SlamManager] {msg}")
+            rospy.logerr(f"{msg}")
             return StartMappingResponse(success=False, message=msg)
         
         # 构建命令
@@ -201,12 +279,12 @@ class SlamManager:
             
             calib_str = "含校准" if req.need_calibration else "跳过校准"
             msg = f"建图已启动 ({calib_str})"
-            rospy.loginfo(f"[SlamManager] {msg}")
+            rospy.loginfo(f"{msg}")
             return StartMappingResponse(success=True, message=msg)
             
         except Exception as e:
             msg = f"启动建图脚本失败: {str(e)}"
-            rospy.logerr(f"[SlamManager] {msg}")
+            rospy.logerr(f"{msg}")
             self.state = SlamState.ERROR
             self._status_message = msg
             return StartMappingResponse(success=False, message=msg)
@@ -233,13 +311,6 @@ class SlamManager:
         if len(map_name) > 50:
             return False, "地图名称过长（最多50个字符）"
         
-        # 检查是否已存在
-        maps_dir = os.path.join(self.kuavo_slam_path, 'maps')
-        map_dir = os.path.join(maps_dir, map_name)
-        
-        if os.path.exists(map_dir):
-            return False, f"地图 '{map_name}' 已存在"
-        
         return True, ""
     
     def _save_map(self, map_name: str) -> tuple:
@@ -261,7 +332,11 @@ class SlamManager:
             # 路径定义
             maps_dir = os.path.join(self.kuavo_slam_path, 'maps')
             map_dir = os.path.join(maps_dir, map_name)
-            faster_lio_pcd_dir = '/media/data/slam_ws/src/faster-lio/PCD'
+            
+            # 保存地图必须确保目录不存在（避免覆盖）
+            if os.path.exists(map_dir):
+                return False, f"地图 '{map_name}' 已存在"
+            faster_lio_pcd_dir = self.faster_lio_pcd_dir
             
             # 检查faster-lio PCD目录是否存在
             if not os.path.exists(faster_lio_pcd_dir):
@@ -276,29 +351,29 @@ class SlamManager:
             
             # 创建地图目录
             os.makedirs(map_dir, exist_ok=True)
-            rospy.loginfo(f"[SlamManager] 创建地图目录: {map_dir}")
+            rospy.loginfo(f"创建地图目录: {map_dir}")
             
             # 移动并重命名PCD文件
             saved_files = []
             for pcd_file in pcd_files:
                 src_filename = os.path.basename(pcd_file)
                 # 重命名为 pointcloud_original.pcd
-                dst_filename = f"pointcloud_original.pcd"
+                dst_filename = self.ori_pointcloud_name
                 dst_path = os.path.join(map_dir, dst_filename)
                 
                 # 移动文件
                 import shutil
                 shutil.move(pcd_file, dst_path)
                 saved_files.append(dst_filename)
-                rospy.loginfo(f"[SlamManager] 已保存: {src_filename} -> {dst_path}")
+                rospy.loginfo(f"已保存: {src_filename} -> {dst_path}")
             
             msg = f"地图已保存到: {map_dir}/ (文件: {', '.join(saved_files)})"
-            rospy.loginfo(f"[SlamManager] {msg}")
+            rospy.loginfo(f"{msg}")
             return True, msg
             
         except Exception as e:
             error_msg = f"保存地图时发生错误: {str(e)}"
-            rospy.logerr(f"[SlamManager] {error_msg}")
+            rospy.logerr(f"{error_msg}")
             return False, error_msg
     
     def _handle_stop_mapping(self, req: StopMapping) -> StopMappingResponse:
@@ -314,26 +389,26 @@ class SlamManager:
         Returns:
             StopMappingResponse: 操作结果
         """
-        rospy.loginfo(f"[SlamManager] 收到停止建图请求 (保存={req.save_map}, 地图名={req.map_name})")
+        rospy.loginfo(f"收到停止建图请求 (保存={req.save_map}, 地图名={req.map_name})")
         
         # 如果需要保存地图，先验证地图名
         if req.save_map:
             valid, error_msg = self._validate_map_name(req.map_name)
             if not valid:
-                rospy.logwarn(f"[SlamManager] 地图名验证失败: {error_msg}")
+                rospy.logwarn(f"地图名验证失败: {error_msg}")
                 return StopMappingResponse(success=False, message=f"地图名非法: {error_msg}")
         
         # 检查当前状态
         if self.state != SlamState.MAPPING:
             msg = f"无法停止建图：当前状态为 {self.state.value}，不是建图状态"
-            rospy.logwarn(f"[SlamManager] {msg}")
+            rospy.logwarn(f"{msg}")
             return StopMappingResponse(success=False, message=msg)
         
         try:
             with self._process_lock:
                 if self._current_process is None:
                     msg = "建图进程不存在"
-                    rospy.logwarn(f"[SlamManager] {msg}")
+                    rospy.logwarn(f"{msg}")
                     self.state = SlamState.IDLE
                     return StopMappingResponse(success=False, message=msg)
                 
@@ -341,10 +416,10 @@ class SlamManager:
                 # 这等同于在终端中按Ctrl+C
                 try:
                     pgid = os.getpgid(self._current_process.pid)
-                    rospy.loginfo(f"[SlamManager] 向进程组 {pgid} 发送SIGINT信号（触发脚本清理和保存地图）...")
+                    rospy.loginfo(f"向进程组 {pgid} 发送SIGINT信号（触发脚本清理和保存地图）...")
                     os.killpg(pgid, signal.SIGINT)
                 except ProcessLookupError:
-                    rospy.logwarn("[SlamManager] 进程已不存在")
+                    rospy.logwarn("进程已不存在")
                     self._current_process = None
                     self.state = SlamState.IDLE
                     return StopMappingResponse(success=True, message="建图进程已结束")
@@ -359,22 +434,22 @@ class SlamManager:
                 while True:
                     with self._process_lock:
                         if self._current_process is None:
-                            rospy.loginfo("[SlamManager] 建图进程已被清理")
+                            rospy.loginfo("建图进程已被清理")
                             break
                         ret = self._current_process.poll()
                         if ret is not None:
-                            rospy.loginfo(f"[SlamManager] 建图脚本已退出，返回码: {ret}")
+                            rospy.loginfo(f"建图脚本已退出，返回码: {ret}")
                             self._current_process = None
                             break
                     
-                    if time.time() - start_wait > timeout:
-                        rospy.logwarn("[SlamManager] 等待建图脚本退出超时，强制终止...")
+                    if time.time() - start_wait > self.stop_mapping_wait_sec:
+                        rospy.logwarn("等待建图脚本退出超时，强制终止...")
                         with self._process_lock:
                             if self._current_process:
                                 try:
                                     pgid = os.getpgid(self._current_process.pid)
                                     os.killpg(pgid, signal.SIGKILL)
-                                    rospy.loginfo(f"[SlamManager] 已强制终止进程组 {pgid}")
+                                    rospy.loginfo(f"已强制终止进程组 {pgid}")
                                 except:
                                     pass
                                 self._current_process = None
@@ -385,15 +460,15 @@ class SlamManager:
                 
                 # 处理地图保存
                 if req.save_map:
-                    rospy.loginfo(f"[SlamManager] 开始保存地图: {req.map_name}")
+                    rospy.loginfo(f"开始保存地图: {req.map_name}")
                     success, msg = self._save_map(req.map_name)
                     if success:
                         self._status_message = f"建图完成，地图已保存: {req.map_name}"
                     else:
                         self._status_message = f"建图完成，但保存地图失败: {msg}"
-                        rospy.logerr(f"[SlamManager] {self._status_message}")
+                        rospy.logerr(f"{self._status_message}")
                 else:
-                    rospy.loginfo("[SlamManager] 不保存地图，跳过")
+                    rospy.loginfo("不保存地图，跳过")
                     self._status_message = "建图完成（未保存地图）"
                 
                 # 更新状态
@@ -409,12 +484,12 @@ class SlamManager:
                 msg = f"停止建图指令已发送，将保存地图到: {req.map_name}"
             else:
                 msg = "停止建图指令已发送（不保存地图）"
-            rospy.loginfo(f"[SlamManager] {msg}")
+            rospy.loginfo(f"{msg}")
             return StopMappingResponse(success=True, message=msg)
             
         except Exception as e:
             msg = f"停止建图时发生错误: {str(e)}"
-            rospy.logerr(f"[SlamManager] {msg}")
+            rospy.logerr(f"{msg}")
             # 确保状态被重置
             with self._process_lock:
                 self._current_process = None
@@ -446,10 +521,10 @@ class SlamManager:
         - 若存在 pointcloud_original.pcd => 认为该目录为“有效地图”
         - 若同时存在 map2d.yaml、map2d.pgm、pointcloud.pcd => 认为“可用于导航”
         """
-        maps_dir = os.path.join(self.kuavo_slam_path, 'maps')
+        maps_dir = self.map_root
         if not os.path.isdir(maps_dir):
             msg = f"maps目录不存在: {maps_dir}"
-            rospy.logwarn(f"[SlamManager] {msg}")
+            rospy.logwarn(f"{msg}")
             return ListMapsResponse(success=False, message=msg, map_names=[], nav_ready=[])
 
         try:
@@ -466,16 +541,16 @@ class SlamManager:
                     continue
 
                 # 有效地图判定
-                ori_pcd_path = os.path.join(subdir, 'pointcloud_original.pcd')
+                ori_pcd_path = os.path.join(subdir, self.ori_pointcloud_name)
                 valid_flag = os.path.isfile(ori_pcd_path)
                 if not valid_flag:
                     continue
 
                 # 可导航判定
-                nav_pcd_path = os.path.join(subdir, 'pointcloud.pcd')
+                nav_pcd_path = os.path.join(subdir, self.nav_pointcloud_name)
                 nav_flag = (
-                    os.path.isfile(os.path.join(subdir, 'map2d.yaml')) and
-                    os.path.isfile(os.path.join(subdir, 'map2d.pgm')) and
+                    os.path.isfile(os.path.join(subdir, self.map2d_yaml_name)) and
+                    os.path.isfile(os.path.join(subdir, self.map2d_pgm_name)) and
                     os.path.isfile(nav_pcd_path)
                 )
 
@@ -518,7 +593,7 @@ class SlamManager:
             )
         except Exception as e:
             msg = f"扫描maps目录失败: {e}"
-            rospy.logerr(f"[SlamManager] {msg}")
+            rospy.logerr(f"{msg}")
             return ListMapsResponse(
                 success=False,
                 message=msg,
@@ -529,6 +604,106 @@ class SlamManager:
                 ori_pointcloud_bytes=[],
                 nav_pointcloud_bytes=[],
             )
+
+    def _handle_process_map(self, req: ProcessMap) -> ProcessMapResponse:
+        """
+        地图处理服务回调：调用 pcd_cleaner/scripts/run_all.sh
+
+        run_all.sh 参数：
+          [地图根目录] [地图名] [屋顶高度阈值] [运行方式]
+
+        其中地图根目录、屋顶高度阈值由配置文件提供；请求只传 map_name 和 mode。
+        """
+        map_name = (req.map_name or '').strip()
+        mode = int(req.mode)
+
+        # map_name 合法性与存在性检查（复用命名规则，但这里要求“已存在地图”）
+        valid, err = self._validate_map_name(map_name)
+        if not valid:
+            return ProcessMapResponse(success=False, message=f"地图名非法: {err}")
+
+        map_dir = os.path.join(self.map_root, map_name)
+        if not os.path.isdir(map_dir):
+            return ProcessMapResponse(success=False, message=f"地图目录不存在: {map_dir}")
+
+        ori_pcd = os.path.join(map_dir, 'pointcloud_original.pcd')
+        if not os.path.isfile(ori_pcd):
+            return ProcessMapResponse(success=False, message=f"缺少原始点云: {ori_pcd}")
+
+        if mode not in (0, 1, 2, 3, 4):
+            return ProcessMapResponse(success=False, message="mode非法，仅支持0/1/2/3/4")
+
+        if not os.path.isfile(self.map_process_script):
+            return ProcessMapResponse(success=False, message=f"地图处理脚本不存在: {self.map_process_script}")
+
+        # 防止并发执行
+        with self._map_process_lock:
+            if self._map_process is not None and self._map_process.poll() is None:
+                return ProcessMapResponse(success=False, message="已有地图处理任务在运行中，请稍后再试")
+
+            cmd = [
+                '/bin/bash',
+                self.map_process_script,
+                self.map_root,
+                map_name,
+                str(self.ceiling_threshold),
+                str(mode),
+            ]
+
+            try:
+                rospy.loginfo(f"开始地图处理: map={map_name}, mode={mode}")
+                rospy.loginfo(f"执行命令: {' '.join(cmd)}")
+
+                self._map_process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                    universal_newlines=True,
+                    bufsize=1,
+                )
+
+                # 输出监控线程（复用同一个monitor函数）
+                threading.Thread(
+                    target=self._monitor_process_output,
+                    args=(self._map_process, f"地图处理:{map_name}"),
+                    daemon=True
+                ).start()
+
+                # 更新状态
+                self.state = SlamState.PROCESSING
+                self._task_start_time = time.time()
+                self._status_message = f"地图处理中: {map_name} (mode={mode})"
+
+            except Exception as e:
+                self._map_process = None
+                self.state = SlamState.ERROR
+                self._status_message = f"启动地图处理失败: {e}"
+                return ProcessMapResponse(success=False, message=self._status_message)
+
+        # 异步等待结束并恢复状态
+        def _wait_done():
+            proc = None
+            with self._map_process_lock:
+                proc = self._map_process
+            if proc is None:
+                return
+            ret = proc.wait()
+            rospy.loginfo(f"地图处理结束: map={map_name}, mode={mode}, code={ret}")
+            with self._map_process_lock:
+                self._map_process = None
+            # 恢复状态（如果此时还处于processing）
+            if self.state == SlamState.PROCESSING:
+                self.state = SlamState.IDLE
+                self._task_start_time = None
+                if ret == 0:
+                    self._status_message = f"地图处理完成: {map_name}"
+                else:
+                    self._status_message = f"地图处理失败(code={ret}): {map_name}"
+
+        threading.Thread(target=_wait_done, daemon=True).start()
+
+        return ProcessMapResponse(success=True, message=f"已启动地图处理: {map_name} (mode={mode})")
     
     def _monitor_process_output(self, process: subprocess.Popen, task_name: str):
         """
@@ -551,11 +726,11 @@ class SlamManager:
                     break
                     
         except Exception as e:
-            rospy.logwarn(f"[SlamManager] 监控{task_name}输出时发生错误: {e}")
+            rospy.logwarn(f"监控{task_name}输出时发生错误: {e}")
         
         finally:
             # 进程结束，检查是否需要更新状态
-            rospy.loginfo(f"[SlamManager] {task_name}进程输出监控结束")
+            rospy.loginfo(f"{task_name}进程输出监控结束")
             
             # 如果进程意外结束（不是通过stop命令），更新状态
             with self._process_lock:
@@ -570,7 +745,7 @@ class SlamManager:
                                 self._status_message = f"{task_name}正常完成"
                             else:
                                 self._status_message = f"{task_name}异常退出 (code={ret})"
-                                rospy.logwarn(f"[SlamManager] {self._status_message}")
+                                rospy.logwarn(f"{self._status_message}")
     
     @staticmethod
     def _strip_ansi(text: str) -> str:
@@ -581,14 +756,14 @@ class SlamManager:
     
     def _on_shutdown(self):
         """节点关闭时的清理操作"""
-        rospy.loginfo("[SlamManager] 节点正在关闭，清理资源...")
+        rospy.loginfo("节点正在关闭，清理资源...")
         
         # 如果有正在运行的进程，发送终止信号
         with self._process_lock:
             if self._current_process is not None:
                 try:
                     pgid = os.getpgid(self._current_process.pid)
-                    rospy.loginfo(f"[SlamManager] 终止运行中的进程组 {pgid}...")
+                    rospy.loginfo(f"终止运行中的进程组 {pgid}...")
                     os.killpg(pgid, signal.SIGINT)
                     
                     # 等待一段时间让进程完成清理
@@ -601,9 +776,9 @@ class SlamManager:
                 except ProcessLookupError:
                     pass
                 except Exception as e:
-                    rospy.logwarn(f"[SlamManager] 清理进程时发生错误: {e}")
+                    rospy.logwarn(f"清理进程时发生错误: {e}")
         
-        rospy.loginfo("[SlamManager] 清理完成")
+        rospy.loginfo("清理完成")
     
     def spin(self):
         """主循环"""
@@ -615,7 +790,7 @@ class SlamManager:
                 if self._current_process is not None:
                     ret = self._current_process.poll()
                     if ret is not None and self.state == SlamState.MAPPING:
-                        rospy.logwarn(f"[SlamManager] 检测到建图进程已退出 (code={ret})")
+                        rospy.logwarn(f"检测到建图进程已退出 (code={ret})")
                         self._current_process = None
                         self.state = SlamState.IDLE
                         self._task_start_time = None
@@ -631,7 +806,7 @@ def main():
     except rospy.ROSInterruptException:
         pass
     except Exception as e:
-        rospy.logerr(f"[SlamManager] 发生未处理的异常: {e}")
+        rospy.logerr(f"发生未处理的异常: {e}")
         raise
 
 

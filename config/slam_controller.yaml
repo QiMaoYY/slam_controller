@@ -1,0 +1,43 @@
+# slam_controller 全局配置（供 slam_controller/scripts/slam_manager.py 读取）
+#
+# 说明：
+# - 该文件用于集中管理“路径/阈值/超时/默认参数”等全局配置，避免散落硬编码
+# - 支持在 slam_manager.py 中通过 ROS 参数覆盖配置文件路径：
+#     ~global_config
+#
+# 建议：统一使用绝对路径；如需用环境变量，可写成 ${HOME}/xxx（代码会 expandvars/expanduser）
+
+# 工作空间与核心目录
+paths:
+  slam_ws: "/media/data/slam_ws"
+  kuavo_slam: "/media/data/slam_ws/src/kuavo_slam"
+  livox_ws: "/media/data/livox_ws"
+  faster_lio_pcd_dir: "/media/data/slam_ws/src/faster-lio/PCD"
+
+# 各类脚本路径（slam_manager 调用外部脚本时使用）
+scripts:
+  start_mapping: "/media/data/slam_ws/src/kuavo_slam/scripts/start_mapping.sh"
+  nav_run: "/media/data/slam_ws/src/kuavo_slam/scripts/nav_run.sh"
+  map_processing: "/media/data/slam_ws/src/pcd_cleaner/scripts/run_all.sh"
+
+# 地图目录相关
+maps:
+  root: "/media/data/slam_ws/src/kuavo_slam/maps"
+  # 约定文件名（便于后续协同统一）
+  ori_pointcloud_name: "pointcloud_original.pcd"
+  nav_pointcloud_name: "pointcloud.pcd"
+  map2d_yaml_name: "map2d.yaml"
+  map2d_pgm_name: "map2d.pgm"
+
+# 地图处理默认参数（run_all.sh）
+map_processing:
+  ceiling_threshold: 0.8     # run_all.sh 第3个参数：屋顶高度阈值
+  default_mode: 0            # 默认运行方式（0/1/2/3/4），仅作为缺省参考
+
+# 超时/等待参数（秒）
+timeouts:
+  stop_mapping_wait_sec: 60          # stop_mapping 等待建图脚本退出的最长时间
+  process_map_wait_sec: 0            # 0表示不超时等待（后台等待直到脚本退出）
+
+
+

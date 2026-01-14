@@ -1,0 +1,11 @@
+# 地图处理服务：调用 pcd_cleaner/run_all.sh 进行点云清理、2D地图生成与点云过滤等
+#
+# 请求参数
+string map_name        # 地图名（对应 kuavo_slam/maps/<map_name>）
+int32 mode             # 运行方式：0全流程；1清理+2D；2编辑2D(从init)；3智能过滤；4继续编辑
+---
+# 响应
+bool success
+string message
+
+

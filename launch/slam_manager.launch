@@ -13,6 +13,8 @@
     服务接口:
         - /slam_manager/start_mapping  开始建图 (参数: need_calibration)
         - /slam_manager/stop_mapping   停止建图
+        - /slam_manager/start_navigation 启动导航 (参数: map_name, enable_rviz, need_calibration)
+        - /slam_manager/stop_navigation  停止导航
         - /slam_manager/get_status     获取系统状态
     
     示例:

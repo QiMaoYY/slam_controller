@@ -14,6 +14,8 @@ Kuavo SLAM 总控节点
 服务接口：
     - /slam_manager/start_mapping  开始建图
     - /slam_manager/stop_mapping   停止建图
+    - /slam_manager/start_navigation 启动导航
+    - /slam_manager/stop_navigation  停止导航
     - /slam_manager/get_status     获取系统状态
 """
 
@@ -32,6 +34,8 @@ import rospy
 from slam_controller.srv import (
     StartMapping, StartMappingResponse,
     StopMapping, StopMappingResponse,
+    StartNavigation, StartNavigationResponse,
+    StopNavigation, StopNavigationResponse,
     GetSlamStatus, GetSlamStatusResponse,
     ListMaps, ListMapsResponse,
     ProcessMap, ProcessMapResponse,
@@ -89,6 +93,8 @@ class SlamManager:
 
         # 超时参数
         self.stop_mapping_wait_sec = int(self._cfg_get('timeouts.stop_mapping_wait_sec', 60))
+        # 导航停止等待时间（默认复用 stop_mapping_wait_sec）
+        self.stop_nav_wait_sec = int(self._cfg_get('timeouts.stop_nav_wait_sec', self.stop_mapping_wait_sec))
         self.process_map_wait_sec = int(self._cfg_get('timeouts.process_map_wait_sec', 0))
         
         # 系统状态
@@ -105,6 +111,10 @@ class SlamManager:
         # 地图处理子进程管理
         self._map_process: Optional[subprocess.Popen] = None
         self._map_process_lock = threading.Lock()
+
+        # 导航子进程管理（与建图分开，便于独立停止/回收）
+        self._nav_process: Optional[subprocess.Popen] = None
+        self._nav_process_lock = threading.Lock()
         
         # 注册ROS Service
         self._setup_services()
@@ -133,6 +143,18 @@ class SlamManager:
             StopMapping, 
             self._handle_stop_mapping
         )
+
+        # 导航相关服务
+        self._srv_start_navigation = rospy.Service(
+            '~start_navigation',
+            StartNavigation,
+            self._handle_start_navigation
+        )
+        self._srv_stop_navigation = rospy.Service(
+            '~stop_navigation',
+            StopNavigation,
+            self._handle_stop_navigation
+        )
         
         # 状态查询服务
         self._srv_get_status = rospy.Service(
@@ -156,6 +178,31 @@ class SlamManager:
         )
         
         rospy.loginfo("服务已注册")
+
+    @staticmethod
+    def _bool_to_sh(v: bool) -> str:
+        """将bool转换为shell脚本期望的 true/false 字符串。"""
+        return 'true' if bool(v) else 'false'
+
+    def _validate_nav_map_ready(self, map_name: str) -> tuple:
+        """
+        校验指定地图是否满足导航启动要求：
+        - 目录存在
+        - 必须包含 map2d.yaml / map2d.pgm / pointcloud.pcd
+        """
+        map_dir = os.path.join(self.map_root, map_name)
+        if not os.path.isdir(map_dir):
+            return False, f"地图目录不存在: {map_dir}"
+
+        required = [
+            os.path.join(map_dir, self.map2d_yaml_name),
+            os.path.join(map_dir, self.map2d_pgm_name),
+            os.path.join(map_dir, self.nav_pointcloud_name),
+        ]
+        missing = [p for p in required if not os.path.isfile(p)]
+        if missing:
+            return False, f"地图未准备好用于导航，缺少文件: {', '.join(missing)}"
+        return True, ""
 
     def _cfg_get(self, key: str, default=None):
         """从self.cfg中读取点分key（如 paths.slam_ws），并做路径展开。"""
@@ -239,7 +286,6 @@ class SlamManager:
             msg = f"无法开始建图：当前状态为 {self.state.value}"
             rospy.logwarn(f"{msg}")
             return StartMappingResponse(success=False, message=msg)
-        
         # 检查脚本是否存在
         if not os.path.exists(self.mapping_script):
             msg = f"建图脚本不存在: {self.mapping_script}"
@@ -288,6 +334,90 @@ class SlamManager:
             self.state = SlamState.ERROR
             self._status_message = msg
             return StartMappingResponse(success=False, message=msg)
+
+    def _handle_start_navigation(self, req: StartNavigation) -> StartNavigationResponse:
+        """
+        处理启动导航请求
+
+        Args:
+            req: StartNavigation请求，包含 map_name / enable_rviz / need_calibration
+        """
+        map_name = (req.map_name or '').strip()
+        rospy.loginfo(
+            f"收到启动导航请求 (map={map_name}, rviz={req.enable_rviz}, 校准={req.need_calibration})"
+        )
+
+        # 检查当前状态
+        if self.state != SlamState.IDLE:
+            msg = f"无法启动导航：当前状态为 {self.state.value}"
+            rospy.logwarn(f"{msg}")
+            return StartNavigationResponse(success=False, message=msg)
+
+        # 地图名合法性校验
+        valid, err = self._validate_map_name(map_name)
+        if not valid:
+            return StartNavigationResponse(success=False, message=f"地图名非法: {err}")
+
+        # 地图是否可用于导航
+        ok, msg = self._validate_nav_map_ready(map_name)
+        if not ok:
+            rospy.logwarn(msg)
+            return StartNavigationResponse(success=False, message=msg)
+
+        # 检查脚本是否存在
+        if not os.path.isfile(self.nav_script):
+            msg = f"导航脚本不存在: {self.nav_script}"
+            rospy.logerr(f"{msg}")
+            return StartNavigationResponse(success=False, message=msg)
+
+        # 构建命令：nav_run.sh <MAP_NAME> <MAP_ROOT> <RVIZ> <CALIB>
+        cmd = [
+            '/bin/bash',
+            self.nav_script,
+            map_name,
+            self.map_root,
+            self._bool_to_sh(req.enable_rviz),
+            self._bool_to_sh(req.need_calibration),
+        ]
+
+        try:
+            with self._nav_process_lock:
+                if self._nav_process is not None and self._nav_process.poll() is None:
+                    return StartNavigationResponse(success=False, message="已有导航任务在运行中")
+
+                self._nav_process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                    universal_newlines=True,
+                    bufsize=1,
+                )
+
+            # 启动输出监控线程
+            threading.Thread(
+                target=self._monitor_process_output,
+                args=(self._nav_process, f"导航:{map_name}"),
+                daemon=True
+            ).start()
+
+            # 更新状态
+            self.state = SlamState.NAVIGATING
+            self._task_start_time = time.time()
+            self._status_message = f"导航进行中: {map_name} (rviz={req.enable_rviz}, calib={req.need_calibration})"
+
+            msg = f"导航已启动: {map_name}"
+            rospy.loginfo(f"{msg}")
+            return StartNavigationResponse(success=True, message=msg)
+
+        except Exception as e:
+            with self._nav_process_lock:
+                self._nav_process = None
+            msg = f"启动导航脚本失败: {str(e)}"
+            rospy.logerr(f"{msg}")
+            self.state = SlamState.ERROR
+            self._status_message = msg
+            return StartNavigationResponse(success=False, message=msg)
     
     def _validate_map_name(self, map_name: str) -> tuple:
         """
@@ -496,6 +626,84 @@ class SlamManager:
             self.state = SlamState.ERROR
             self._status_message = msg
             return StopMappingResponse(success=False, message=msg)
+        
+    def _handle_stop_navigation(self, req: StopNavigation) -> StopNavigationResponse:
+        """
+        处理停止导航请求：向导航脚本所在进程组发送 SIGINT（等同Ctrl+C）
+        """
+        rospy.loginfo("收到停止导航请求")
+
+        if self.state != SlamState.NAVIGATING:
+            msg = f"无法停止导航：当前状态为 {self.state.value}，不是导航状态"
+            rospy.logwarn(f"{msg}")
+            return StopNavigationResponse(success=False, message=msg)
+
+        try:
+            with self._nav_process_lock:
+                if self._nav_process is None:
+                    msg = "导航进程不存在"
+                    rospy.logwarn(msg)
+                    self.state = SlamState.IDLE
+                    return StopNavigationResponse(success=False, message=msg)
+
+                try:
+                    pgid = os.getpgid(self._nav_process.pid)
+                    rospy.loginfo(f"向导航进程组 {pgid} 发送SIGINT信号...")
+                    os.killpg(pgid, signal.SIGINT)
+                except ProcessLookupError:
+                    rospy.logwarn("导航进程已不存在")
+                    self._nav_process = None
+                    self.state = SlamState.IDLE
+                    return StopNavigationResponse(success=True, message="导航进程已结束")
+
+            # 异步等待退出并清理
+            def wait_for_nav_exit():
+                start_wait = time.time()
+                while True:
+                    with self._nav_process_lock:
+                        if self._nav_process is None:
+                            break
+                        ret = self._nav_process.poll()
+                        if ret is not None:
+                            rospy.loginfo(f"导航脚本已退出，返回码: {ret}")
+                            self._nav_process = None
+                            break
+
+                    if time.time() - start_wait > self.stop_nav_wait_sec:
+                        rospy.logwarn("等待导航脚本退出超时，强制终止...")
+                        with self._nav_process_lock:
+                            if self._nav_process:
+                                try:
+                                    pgid = os.getpgid(self._nav_process.pid)
+                                    os.killpg(pgid, signal.SIGKILL)
+                                    rospy.loginfo(f"已强制终止导航进程组 {pgid}")
+                                except Exception:
+                                    pass
+                                self._nav_process = None
+                        break
+
+                    time.sleep(0.5)
+
+                # 更新状态
+                if self.state == SlamState.NAVIGATING:
+                    self.state = SlamState.IDLE
+                    self._task_start_time = None
+                    self._status_message = "导航已停止"
+
+            threading.Thread(target=wait_for_nav_exit, daemon=True).start()
+
+            msg = "停止导航指令已发送"
+            rospy.loginfo(msg)
+            return StopNavigationResponse(success=True, message=msg)
+
+        except Exception as e:
+            msg = f"停止导航时发生错误: {str(e)}"
+            rospy.logerr(msg)
+            with self._nav_process_lock:
+                self._nav_process = None
+            self.state = SlamState.ERROR
+            self._status_message = msg
+            return StopNavigationResponse(success=False, message=msg)
     
     def _handle_get_status(self, req: GetSlamStatus) -> GetSlamStatusResponse:
         """
@@ -746,6 +954,21 @@ class SlamManager:
                             else:
                                 self._status_message = f"{task_name}异常退出 (code={ret})"
                                 rospy.logwarn(f"{self._status_message}")
+
+            # 导航进程退出后的状态恢复
+            with self._nav_process_lock:
+                if self._nav_process == process:
+                    ret = process.poll()
+                    if ret is not None:
+                        self._nav_process = None
+                        if self.state == SlamState.NAVIGATING:
+                            self.state = SlamState.IDLE
+                            self._task_start_time = None
+                            if ret == 0:
+                                self._status_message = f"{task_name}正常完成"
+                            else:
+                                self._status_message = f"{task_name}异常退出 (code={ret})"
+                                rospy.logwarn(f"{self._status_message}")
     
     @staticmethod
     def _strip_ansi(text: str) -> str:
@@ -777,6 +1000,36 @@ class SlamManager:
                     pass
                 except Exception as e:
                     rospy.logwarn(f"清理进程时发生错误: {e}")
+
+        # 清理导航进程
+        with self._nav_process_lock:
+            if self._nav_process is not None:
+                try:
+                    pgid = os.getpgid(self._nav_process.pid)
+                    rospy.loginfo(f"终止运行中的导航进程组 {pgid}...")
+                    os.killpg(pgid, signal.SIGINT)
+                    time.sleep(3)
+                    if self._nav_process.poll() is None:
+                        os.killpg(pgid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                except Exception as e:
+                    rospy.logwarn(f"清理导航进程时发生错误: {e}")
+
+        # 清理地图处理进程
+        with self._map_process_lock:
+            if self._map_process is not None:
+                try:
+                    pgid = os.getpgid(self._map_process.pid)
+                    rospy.loginfo(f"终止运行中的地图处理进程组 {pgid}...")
+                    os.killpg(pgid, signal.SIGINT)
+                    time.sleep(3)
+                    if self._map_process.poll() is None:
+                        os.killpg(pgid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                except Exception as e:
+                    rospy.logwarn(f"清理地图处理进程时发生错误: {e}")
         
         rospy.loginfo("清理完成")
     
@@ -792,6 +1045,16 @@ class SlamManager:
                     if ret is not None and self.state == SlamState.MAPPING:
                         rospy.logwarn(f"检测到建图进程已退出 (code={ret})")
                         self._current_process = None
+                        self.state = SlamState.IDLE
+                        self._task_start_time = None
+
+            # 检查导航进程是否意外退出
+            with self._nav_process_lock:
+                if self._nav_process is not None:
+                    ret = self._nav_process.poll()
+                    if ret is not None and self.state == SlamState.NAVIGATING:
+                        rospy.logwarn(f"检测到导航进程已退出 (code={ret})")
+                        self._nav_process = None
                         self.state = SlamState.IDLE
                         self._task_start_time = None
             

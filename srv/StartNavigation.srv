@@ -1,0 +1,10 @@
+# 启动导航服务
+# 请求
+string map_name           # 地图名称（kuavo_slam/maps 下的子目录名）
+bool enable_rviz          # 是否启动 RViz
+bool need_calibration     # 是否执行雷达自动校准
+---
+# 响应
+bool success              # 操作是否成功
+string message            # 返回消息
+

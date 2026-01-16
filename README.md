@@ -5,6 +5,7 @@ SLAM系统总控节点，提供ROS Service接口统一管理Kuavo机器人的SLA
 ## 功能
 
 - 🎯 **建图控制**：通过ROS Service启动/停止建图流程
+- 🧭 **导航控制**：通过ROS Service启动/停止导航流程
 - 📊 **状态管理**：实时维护SLAM系统状态（空闲/建图中/定位中/导航中）
 - 🔄 **进程管理**：管理建图、导航脚本的生命周期
 - 📝 **日志监控**：监控并转发子进程输出到ROS日志
@@ -47,14 +48,44 @@ rosservice call /slam_manager/start_mapping "need_calibration: false"
 
 #### 2. 停止建图
 ```bash
-rosservice call /slam_manager/stop_mapping "{}"
-```
-停止建图后，脚本会自动保存地图到 `kuavo_slam/PCD/` 目录。
+# 不保存地图
+rosservice call /slam_manager/stop_mapping "save_map: false
+map_name: ''"
 
-#### 3. 获取系统状态
+# 保存地图（目录名为 demo_map）
+rosservice call /slam_manager/stop_mapping "save_map: true
+map_name: 'demo_map'"
+```
+停止建图后，若 `save_map=true`，总控会将点云保存到 `kuavo_slam/maps/<map_name>/`（实际根目录由 `slam_controller/config/slam_controller.yaml` 的 `maps.root` 决定）。
+
+#### 3. 启动导航
+```bash
+# 启动导航（地图名=demo_map，开启RViz，执行校准）
+rosservice call /slam_manager/start_navigation "map_name: 'demo_map'
+enable_rviz: true
+need_calibration: true"
+
+# 启动导航（关闭RViz，跳过校准）
+rosservice call /slam_manager/start_navigation "map_name: 'demo_map'
+enable_rviz: false
+need_calibration: false"
+```
+
+#### 4. 停止导航
+```bash
+rosservice call /slam_manager/stop_navigation "{}"
+```
+
+#### 5. 获取系统状态
 ```bash
 rosservice call /slam_manager/get_status "{}"
 ```
+
+#### 6. 地图列表/地图处理（可选）
+
+对应文档：
+- `docs/list_maps_service.md`
+- `docs/process_map_service.md`
 
 **返回示例：**
 ```yaml
@@ -80,9 +111,17 @@ slam_controller/
 ├── CMakeLists.txt              # CMake配置
 ├── package.xml                 # 包依赖定义
 ├── README.md                   # 本文档
+├── docs/                       # 文档
+│   ├── navigation_service.md   # 导航服务说明
+│   ├── list_maps_service.md    # 地图列表服务说明
+│   └── process_map_service.md  # 地图处理服务说明
 ├── srv/                        # Service定义
 │   ├── StartMapping.srv        # 开始建图服务
 │   ├── StopMapping.srv         # 停止建图服务
+│   ├── StartNavigation.srv     # 启动导航服务
+│   ├── StopNavigation.srv      # 停止导航服务
+│   ├── ListMaps.srv            # 地图列表服务
+│   ├── ProcessMap.srv          # 地图处理服务
 │   └── GetSlamStatus.srv       # 获取状态服务
 ├── scripts/                    # 脚本文件
 │   ├── slam_manager.py         # 主控节点

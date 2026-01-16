@@ -12,6 +12,8 @@ add_service_files(
   FILES
   StartMapping.srv
   StopMapping.srv
+  StartNavigation.srv
+  StopNavigation.srv
   GetSlamStatus.srv
   ListMaps.srv
   ProcessMap.srv

@@ -37,6 +37,7 @@ map_processing:
 # 超时/等待参数（秒）
 timeouts:
   stop_mapping_wait_sec: 60          # stop_mapping 等待建图脚本退出的最长时间
+  stop_nav_wait_sec: 20              # stop_navigation 等待导航脚本退出的最长时间
   process_map_wait_sec: 0            # 0表示不超时等待（后台等待直到脚本退出）
 
 

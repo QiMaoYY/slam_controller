@@ -519,14 +519,23 @@ class SlamManager:
         Returns:
             StopMappingResponse: 操作结果
         """
-        rospy.loginfo(f"收到停止建图请求 (保存={req.save_map}, 地图名={req.map_name})")
-        
-        # 如果需要保存地图，先验证地图名
+        map_name = (req.map_name or '').strip()
+        rospy.loginfo(f"收到停止建图请求 (保存={req.save_map}, 地图名={map_name})")
+
+        # 如果需要保存地图，先做“合法性 + 重名”预检查
+        # 重要：若不通过，必须直接返回失败且不得停止建图进程（避免丢图）
         if req.save_map:
-            valid, error_msg = self._validate_map_name(req.map_name)
+            valid, error_msg = self._validate_map_name(map_name)
             if not valid:
-                rospy.logwarn(f"地图名验证失败: {error_msg}")
+                rospy.logwarn(f"地图名验证失败: {error_msg}，将保持建图继续运行")
                 return StopMappingResponse(success=False, message=f"地图名非法: {error_msg}")
+
+            # 重名检查：maps.root/<map_name> 已存在则拒绝
+            map_dir = os.path.join(self.map_root, map_name)
+            if os.path.exists(map_dir):
+                msg = f"地图名重复：'{map_name}' 已存在，将保持建图继续运行"
+                rospy.logwarn(msg)
+                return StopMappingResponse(success=False, message=msg)
         
         # 检查当前状态
         if self.state != SlamState.MAPPING:
@@ -590,10 +599,10 @@ class SlamManager:
                 
                 # 处理地图保存
                 if req.save_map:
-                    rospy.loginfo(f"开始保存地图: {req.map_name}")
-                    success, msg = self._save_map(req.map_name)
+                    rospy.loginfo(f"开始保存地图: {map_name}")
+                    success, msg = self._save_map(map_name)
                     if success:
-                        self._status_message = f"建图完成，地图已保存: {req.map_name}"
+                        self._status_message = f"建图完成，地图已保存: {map_name}"
                     else:
                         self._status_message = f"建图完成，但保存地图失败: {msg}"
                         rospy.logerr(f"{self._status_message}")
@@ -611,7 +620,7 @@ class SlamManager:
             
             # 立即返回响应，不等待进程退出
             if req.save_map:
-                msg = f"停止建图指令已发送，将保存地图到: {req.map_name}"
+                msg = f"停止建图指令已发送，将保存地图到: {map_name}"
             else:
                 msg = "停止建图指令已发送（不保存地图）"
             rospy.loginfo(f"{msg}")

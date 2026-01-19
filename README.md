@@ -125,6 +125,8 @@ slam_controller/
 │   └── GetSlamStatus.srv       # 获取状态服务
 ├── scripts/                    # 脚本文件
 │   ├── slam_manager.py         # 主控节点
+│   ├── srv_handlers.py         # Service回调实现
+│   ├── utils.py                # 工具函数与通用类型
 │   └── run_slam_manager.sh     # 启动脚本
 └── launch/                     # Launch文件
     └── slam_manager.launch     # 节点启动配置

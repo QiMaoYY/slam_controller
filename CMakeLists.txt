@@ -38,6 +38,8 @@ install(DIRECTORY launch config
 install(PROGRAMS
   scripts/slam_manager.py
   scripts/run_slam_manager.sh
+  scripts/utils.py
+  scripts/srv_handlers.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 

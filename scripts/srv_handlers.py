@@ -18,6 +18,8 @@ from slam_controller.srv import (
     StopMapping, StopMappingResponse,
     StartNavigation, StartNavigationResponse,
     StopNavigation, StopNavigationResponse,
+    GetMapTasks, GetMapTasksResponse,
+    SetMapTasks, SetMapTasksResponse,
     GetSlamStatus, GetSlamStatusResponse,
     ListMaps, ListMapsResponse,
     ProcessMap, ProcessMapResponse,
@@ -29,6 +31,11 @@ from utils import (
     validate_map_name,
     validate_nav_map_ready,
     save_map,
+    nav_tasks_path,
+    build_empty_nav_tasks,
+    parse_nav_tasks_yaml,
+    normalize_nav_tasks,
+    dump_nav_tasks_yaml,
 )
 
 
@@ -544,4 +551,87 @@ class SlamServiceHandlers:
         threading.Thread(target=_wait_done, daemon=True).start()
 
         return ProcessMapResponse(success=True, message=f"已启动地图处理: {map_name} (mode={mode})")
+
+    def _handle_get_map_tasks(self, req: GetMapTasks) -> GetMapTasksResponse:
+        """
+        地图任务查询服务：若任务文件不存在则创建空文件
+        """
+        map_name = (req.map_name or '').strip()
+        valid, err = validate_map_name(map_name)
+        if not valid:
+            return GetMapTasksResponse(success=False, message=f"地图名非法: {err}", tasks_yaml="")
+
+        map_dir = os.path.join(self.map_root, map_name)
+        if not os.path.isdir(map_dir):
+            return GetMapTasksResponse(success=False, message=f"地图目录不存在: {map_dir}", tasks_yaml="")
+
+        task_path = nav_tasks_path(self.map_root, map_name)
+        if not os.path.isfile(task_path):
+            data = build_empty_nav_tasks(map_name)
+            tasks_yaml = dump_nav_tasks_yaml(data)
+            try:
+                with open(task_path, 'w', encoding='utf-8') as f:
+                    f.write(tasks_yaml)
+            except Exception as e:
+                msg = f"创建任务文件失败: {e}"
+                rospy.logerr(msg)
+                return GetMapTasksResponse(success=False, message=msg, tasks_yaml="")
+
+            msg = "任务文件不存在，已创建空文件"
+            return GetMapTasksResponse(success=True, message=msg, tasks_yaml=tasks_yaml)
+
+        try:
+            with open(task_path, 'r', encoding='utf-8') as f:
+                tasks_yaml = f.read()
+        except Exception as e:
+            msg = f"读取任务文件失败: {e}"
+            rospy.logerr(msg)
+            return GetMapTasksResponse(success=False, message=msg, tasks_yaml="")
+
+        ok, data, err = parse_nav_tasks_yaml(tasks_yaml)
+        if not ok:
+            return GetMapTasksResponse(success=False, message=err, tasks_yaml="")
+
+        if data.get("map_name") and data.get("map_name") != map_name:
+            msg = f"任务文件map_name不匹配: {data.get('map_name')} != {map_name}"
+            return GetMapTasksResponse(success=False, message=msg, tasks_yaml="")
+
+        return GetMapTasksResponse(success=True, message="已读取任务文件", tasks_yaml=tasks_yaml)
+
+    def _handle_set_map_tasks(self, req: SetMapTasks) -> SetMapTasksResponse:
+        """
+        地图任务写入服务：若任务文件不存在则创建，已存在则覆盖
+        """
+        map_name = (req.map_name or '').strip()
+        valid, err = validate_map_name(map_name)
+        if not valid:
+            return SetMapTasksResponse(success=False, message=f"地图名非法: {err}")
+
+        map_dir = os.path.join(self.map_root, map_name)
+        if not os.path.isdir(map_dir):
+            return SetMapTasksResponse(success=False, message=f"地图目录不存在: {map_dir}")
+
+        tasks_yaml = (req.tasks_yaml or '').strip()
+        if not tasks_yaml:
+            return SetMapTasksResponse(success=False, message="tasks_yaml为空")
+
+        ok, data, err = parse_nav_tasks_yaml(tasks_yaml)
+        if not ok:
+            return SetMapTasksResponse(success=False, message=err)
+
+        ok, data, err = normalize_nav_tasks(map_name, data)
+        if not ok:
+            return SetMapTasksResponse(success=False, message=err)
+
+        tasks_yaml = dump_nav_tasks_yaml(data)
+        task_path = nav_tasks_path(self.map_root, map_name)
+        try:
+            with open(task_path, 'w', encoding='utf-8') as f:
+                f.write(tasks_yaml)
+        except Exception as e:
+            msg = f"写入任务文件失败: {e}"
+            rospy.logerr(msg)
+            return SetMapTasksResponse(success=False, message=msg)
+
+        return SetMapTasksResponse(success=True, message="任务文件已写入")
 

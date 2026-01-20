@@ -11,6 +11,7 @@ import shutil
 from enum import Enum
 
 import rospy
+import yaml
 
 
 class SlamState(Enum):
@@ -180,4 +181,77 @@ def save_map(map_name: str,
         error_msg = f"保存地图时发生错误: {str(e)}"
         rospy.logerr(f"{error_msg}")
         return False, error_msg
+
+
+NAV_TASKS_FILENAME = "nav_tasks.yaml"
+
+
+def nav_tasks_path(map_root: str, map_name: str) -> str:
+    """获取导航任务文件路径"""
+    return os.path.join(map_root, map_name, NAV_TASKS_FILENAME)
+
+
+def build_empty_nav_tasks(map_name: str) -> dict:
+    """构建空任务文件结构"""
+    return {
+        "version": "1.0",
+        "map_name": map_name,
+        "task_groups": [],
+    }
+
+
+def parse_nav_tasks_yaml(text: str) -> tuple:
+    """
+    解析任务 YAML 字符串
+
+    Returns:
+        (bool, dict|None, str): (是否成功, 数据, 错误信息)
+    """
+    try:
+        data = yaml.safe_load(text)
+    except Exception as e:
+        return False, None, f"YAML解析失败: {e}"
+
+    if data is None:
+        data = {}
+
+    if not isinstance(data, dict):
+        return False, None, "任务文件顶层必须是字典"
+
+    return True, data, ""
+
+
+def normalize_nav_tasks(map_name: str, data: dict) -> tuple:
+    """
+    规范化任务结构（补齐必要字段）
+
+    Returns:
+        (bool, dict|None, str): (是否成功, 规范化数据, 错误信息)
+    """
+    if not isinstance(data, dict):
+        return False, None, "任务数据必须是字典"
+
+    if data.get("map_name") and data.get("map_name") != map_name:
+        return False, None, f"map_name不一致：{data.get('map_name')} != {map_name}"
+
+    data["map_name"] = map_name
+    if not data.get("version"):
+        data["version"] = "1.0"
+
+    if "task_groups" not in data or data["task_groups"] is None:
+        data["task_groups"] = []
+    if not isinstance(data["task_groups"], list):
+        return False, None, "task_groups必须为list"
+
+    return True, data, ""
+
+
+def dump_nav_tasks_yaml(data: dict) -> str:
+    """将任务结构序列化为 YAML 字符串"""
+    return yaml.safe_dump(
+        data,
+        allow_unicode=True,
+        sort_keys=False,
+        default_flow_style=False,
+    )
 

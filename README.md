@@ -113,6 +113,7 @@ slam_controller/
 ├── README.md                   # 本文档
 ├── docs/                       # 文档
 │   ├── navigation_service.md   # 导航服务说明
+│   ├── map_tasks_service.md    # 地图任务服务说明
 │   ├── list_maps_service.md    # 地图列表服务说明
 │   └── process_map_service.md  # 地图处理服务说明
 ├── srv/                        # Service定义

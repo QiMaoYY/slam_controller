@@ -34,6 +34,8 @@ from slam_controller.srv import (
     StopMapping,
     StartNavigation,
     StopNavigation,
+    GetMapTasks,
+    SetMapTasks,
     GetSlamStatus,
     ListMaps,
     ProcessMap,
@@ -168,6 +170,18 @@ class SlamManager(SlamServiceHandlers):
             '~process_map',
             ProcessMap,
             self._handle_process_map
+        )
+
+        # 地图任务服务
+        self._srv_get_map_tasks = rospy.Service(
+            '~get_map_tasks',
+            GetMapTasks,
+            self._handle_get_map_tasks
+        )
+        self._srv_set_map_tasks = rospy.Service(
+            '~set_map_tasks',
+            SetMapTasks,
+            self._handle_set_map_tasks
         )
         
         rospy.loginfo("服务已注册")

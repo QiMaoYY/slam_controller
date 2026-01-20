@@ -1,0 +1,9 @@
+# 地图任务写入服务
+# 请求
+string map_name          # 地图名称（对应 maps/<map_name>）
+string tasks_yaml        # 任务文件内容（YAML）
+---
+# 响应
+bool success             # 操作是否成功
+string message           # 返回消息
+

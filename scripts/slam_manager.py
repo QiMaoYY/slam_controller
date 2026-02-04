@@ -73,7 +73,7 @@ class SlamManager(SlamServiceHandlers):
         # 脚本路径
         self.mapping_script = cfg_get(self.cfg, 'scripts.start_mapping', os.path.join(self.kuavo_slam_path, 'scripts', 'start_mapping.sh'))
         self.nav_script = cfg_get(self.cfg, 'scripts.nav_run', os.path.join(self.kuavo_slam_path, 'scripts', 'nav_run.sh'))
-        self.map_process_script = cfg_get(self.cfg, 'scripts.map_processing', '/media/data/slam_ws/src/pcd_cleaner/scripts/run_all.sh')
+        self.map_process_script = cfg_get(self.cfg, 'scripts.map_processing', '/media/data/slam_ws/src/map_editor/scripts/run_all.sh')
 
         # 地图目录与文件名约定
         self.map_root = cfg_get(self.cfg, 'maps.root', os.path.join(self.kuavo_slam_path, 'maps'))

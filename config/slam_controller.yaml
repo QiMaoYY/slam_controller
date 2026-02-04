@@ -18,7 +18,7 @@ paths:
 scripts:
   start_mapping: "/media/data/slam_ws/src/kuavo_slam/scripts/start_mapping.sh"
   nav_run: "/media/data/slam_ws/src/kuavo_slam/scripts/nav_run.sh"
-  map_processing: "/media/data/slam_ws/src/pcd_cleaner/scripts/run_all.sh"
+  map_processing: "/media/data/slam_ws/src/map_editor/scripts/run_all.sh"
 
 # 地图目录相关
 maps:

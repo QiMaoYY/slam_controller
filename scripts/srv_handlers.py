@@ -465,7 +465,7 @@ class SlamServiceHandlers:
 
     def _handle_process_map(self, req: ProcessMap) -> ProcessMapResponse:
         """
-        地图处理服务回调：调用 pcd_cleaner/scripts/run_all.sh
+        地图处理服务回调：调用 map_editor/scripts/run_all.sh
         """
         map_name = (req.map_name or '').strip()
         mode = int(req.mode)

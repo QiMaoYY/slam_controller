@@ -7,7 +7,7 @@
 
 ## 功能
 
-通过服务调用后台执行脚本：`src/pcd_cleaner/scripts/run_all.sh`，用于完成点云清理、2D地图生成、编辑与点云过滤等流程。
+通过服务调用后台执行脚本：`src/map_editor/scripts/run_all.sh`，用于完成点云清理、2D地图生成、编辑与点云过滤等流程。
 
 脚本参数格式：
 
